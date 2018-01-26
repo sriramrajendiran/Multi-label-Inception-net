@@ -2,7 +2,7 @@ import tensorflow as tf
 import sys
 
 # change this as you see fit
-image_path = sys.argv[1]
+image_path = '/Users/sriramr/Desktop/test_blur/re/1.jpg'
 
 # Read in the image_data
 image_data = tf.gfile.FastGFile(image_path, 'rb').read()
@@ -12,16 +12,16 @@ label_lines = [line.rstrip() for line
                    in tf.gfile.GFile("labels.txt")]
 
 # Unpersists graph from file
-with tf.gfile.FastGFile("retrained_graph.pb", 'rb') as f:
+with tf.gfile.FastGFile("/goshposh/Multi-label-Inception-net/models/output_graph.pb", 'rb') as f:
     graph_def = tf.GraphDef()
     graph_def.ParseFromString(f.read())
     _ = tf.import_graph_def(graph_def, name='')
 
 with tf.Session() as sess:
     # Feed the image_data as input to the graph and get first prediction
-    softmax_tensor = sess.graph.get_tensor_by_name('final_result:0')
+    sigmoid_tensor = sess.graph.get_tensor_by_name('final_result:0')
     
-    predictions = sess.run(softmax_tensor, \
+    predictions = sess.run(sigmoid_tensor, \
              {'DecodeJpeg/contents:0': image_data})
     
     # Sort to show labels of first prediction in order of confidence
