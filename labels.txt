@@ -3,10 +3,5 @@ ofs
 hrm
 spm
 nal
-otx
-sug
-mtb
-mtcg
-mtcd
 prh
 nfh

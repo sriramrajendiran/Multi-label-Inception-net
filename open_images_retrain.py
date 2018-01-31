@@ -20,7 +20,6 @@ from tensorflow.python.framework import graph_util
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.platform import gfile
 from tensorflow.python.util import compat
-from tensorflow.contrib import learn
 
 import struct
 
@@ -29,9 +28,9 @@ FLAGS = tf.app.flags.FLAGS
 # Input and output file flags.
 tf.app.flags.DEFINE_string('image_dir', '',
                            """Path to folders of labeled images.""")
-tf.app.flags.DEFINE_string('output_graph', '/goshposh/Multi-label-Inception-net/models/combined/combined_output_graph.pb',
+tf.app.flags.DEFINE_string('output_graph', '/goshposh/Multi-label-Inception-net/models/output_graph.pb',
                            """Where to save the trained graph.""")
-tf.app.flags.DEFINE_string('output_labels', '/goshposh/Multi-label-Inception-net/models/combined/output_labels.txt',
+tf.app.flags.DEFINE_string('output_labels', '/goshposh/Multi-label-Inception-net/models/output_labels.txt',
                            """Where to save the trained graph's labels.""")
 tf.app.flags.DEFINE_string('summaries_dir', '/tmp/retrain_logs',
                            """Where to save summary logs for TensorBoard.""")
@@ -97,13 +96,12 @@ tf.app.flags.DEFINE_integer(
 # pylint: disable=line-too-long
 DATA_URL = 'http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz'
 # pylint: enable=line-too-long
-BOTTLENECK_TENSOR_NAME = 'pool_3/_reshape:0'
+BOTTLENECK_TENSOR_NAME = "InceptionV3/Logits/Dropout_1b/Identity:0"
 BOTTLENECK_TENSOR_SIZE = 2048
 MODEL_INPUT_WIDTH = 299
 MODEL_INPUT_HEIGHT = 299
 MODEL_INPUT_DEPTH = 3
-JPEG_DATA_TENSOR_NAME = 'DecodeJpeg/contents:0'
-RESIZED_INPUT_TENSOR_NAME = 'ResizeBilinear:0'
+JPEG_DATA_TENSOR_NAME = "input:0"
 MAX_NUM_IMAGES_PER_CLASS = 2 ** 27 - 1  # ~134M
 
 # Directory containing files with correct image labels for each image.
@@ -292,17 +290,18 @@ def create_inception_graph():
       Graph holding the trained Inception network, and various tensors we'll be
       manipulating.
     """
+    model_dir = '/goshposh/Multi-label-Inception-net/'
     with tf.Session() as sess:
         model_filename = os.path.join(
-            FLAGS.model_dir, 'classify_image_graph_def.pb')
+            model_dir, 'inference_graph.pb')
         with gfile.FastGFile(model_filename, 'rb') as f:
             graph_def = tf.GraphDef()
             graph_def.ParseFromString(f.read())
-            bottleneck_tensor, jpeg_data_tensor, resized_input_tensor = (
+            bottleneck_tensor, jpeg_data_tensor = (
                 tf.import_graph_def(graph_def, name='', return_elements=[
-                    BOTTLENECK_TENSOR_NAME, JPEG_DATA_TENSOR_NAME,
-                    RESIZED_INPUT_TENSOR_NAME]))
-    return sess.graph, bottleneck_tensor, jpeg_data_tensor, resized_input_tensor
+                    BOTTLENECK_TENSOR_NAME, JPEG_DATA_TENSOR_NAME]))
+            bottleneck_tensor = tf.reshape(bottleneck_tensor, [1, 2048])
+    return sess.graph, bottleneck_tensor, jpeg_data_tensor
 
 
 def run_bottleneck_on_image(sess, image_data, image_data_tensor,
@@ -432,13 +431,9 @@ def get_or_create_bottleneck(sess, image_lists, label_name, index, image_dir,
         if not gfile.Exists(image_path):
             tf.logging.fatal('File does not exist %s', image_path)
         image_data = gfile.FastGFile(image_path, 'rb').read()
-        try:
-            bottleneck_values = run_bottleneck_on_image(sess, image_data,
-                                                        jpeg_data_tensor,
-                                                        bottleneck_tensor)
-        except Exception:
-            print(image_path)
-            return None
+        bottleneck_values = run_bottleneck_on_image(sess, image_data,
+                                                    jpeg_data_tensor,
+                                                    bottleneck_tensor)
         bottleneck_string = ','.join(str(x) for x in bottleneck_values)
         with open(bottleneck_path, 'w') as bottleneck_file:
             bottleneck_file.write(bottleneck_string)
@@ -756,7 +751,7 @@ def variable_summaries(var, name):
         tf.histogram_summary(name, var)
 
 
-def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor, vocab_size, sequence_length):
+def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor):
     """Adds a new sigmoid and fully-connected layer for training.
 
     We need to retrain the top layer to identify our new classes, so this function
@@ -781,8 +776,6 @@ def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor, vo
             bottleneck_tensor, shape=[None, BOTTLENECK_TENSOR_SIZE],
             name='BottleneckInputPlaceholder')
 
-        descriptions_input = tf.placeholder(tf.int32, [None, sequence_length], name='DescriptionsInput')
-
         ground_truth_input = tf.placeholder(tf.float32,
                                             [None, class_count],
                                             name='GroundTruthInput')
@@ -791,65 +784,6 @@ def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor, vo
     # to see in TensorBoard
     layer_name = 'final_training_ops'
     with tf.name_scope(layer_name):
-        num_filters = 32
-        filter_sizes = [3, 4, 5]
-        dropout_keep_prob = 0.5
-        embedding_size = 50
-
-        # text training
-        # Embedding layer
-        with tf.name_scope('embedding'):
-            W = tf.Variable(tf.random_uniform([vocab_size, embedding_size], -1.0, 1.0), name='W')
-            embedded_chars = tf.nn.embedding_lookup(W, descriptions_input)
-            embedded_chars_expanded = tf.expand_dims(embedded_chars, -1)
-
-        # Create a convolution + maxpool layer for each filter size
-
-        pooled_outputs = []
-        for i, filter_size in enumerate(filter_sizes):
-            with tf.name_scope('conv-maxpool-%s' % filter_size):
-                # Convolution Layer
-                filter_shape = [filter_size, embedding_size, 1, num_filters]     # num filters - 32
-                W = tf.Variable(tf.truncated_normal(filter_shape, stddev=0.1), name='W')
-                b = tf.Variable(tf.constant(0.1, shape=[num_filters]), name='b')
-                conv = tf.nn.conv2d(
-                    embedded_chars_expanded,
-                    W,
-                    strides=[1, 1, 1, 1],
-                    padding='VALID',
-                    name='conv')
-
-                # Apply nonlinearity
-                h = tf.nn.relu(tf.nn.bias_add(conv, b), name='relu')
-
-                # Maxpooling over the outputs
-                pooled = tf.nn.max_pool(
-                    h,
-                    ksize=[1, sequence_length - filter_size + 1, 1, 1],
-                    strides=[1, 1, 1, 1],
-                    padding='VALID',
-                    name='pool')
-                pooled_outputs.append(pooled)
-
-        # Combine all the pooled features
-        num_filters_total = num_filters * len(filter_sizes)
-        h_pool = tf.concat(3, pooled_outputs)
-        h_pool_flat = tf.reshape(h_pool, [-1, num_filters_total])
-
-        # Add dropout
-        with tf.name_scope('dropout'):
-            h_drop = tf.nn.dropout(h_pool_flat, dropout_keep_prob)
-
-        # Final (unnormalized) scores and predictions
-        with tf.name_scope('output'):
-            W = tf.get_variable(
-                'W',
-                shape=[num_filters_total, class_count],
-                initializer=tf.contrib.layers.xavier_initializer())
-            b = tf.Variable(tf.constant(0.1, shape=[class_count]), name='b')
-            scores = tf.nn.xw_plus_b(h_drop, W, b, name='scores')
-
-
         with tf.name_scope('weights'):
             layer_weights = tf.Variable(tf.truncated_normal([BOTTLENECK_TENSOR_SIZE, class_count], stddev=0.001),
                                         name='final_weights')
@@ -861,26 +795,21 @@ def add_final_training_ops(class_count, final_tensor_name, bottleneck_tensor, vo
             logits = tf.matmul(bottleneck_input, layer_weights) + layer_biases
             tf.histogram_summary(layer_name + '/pre_activations', logits)
 
-    final_tensor = tf.nn.sigmoid(logits + scores, name=final_tensor_name)
+    final_tensor = tf.nn.sigmoid(logits, name=final_tensor_name)
     tf.histogram_summary(final_tensor_name + '/activations', final_tensor)
 
     with tf.name_scope('cross_entropy'):
         cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(
             logits, ground_truth_input)
-
-        desc_cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(
-            scores, ground_truth_input)
-
         with tf.name_scope('total'):
-            # reduce the combined entropy loss
-            cross_entropy_mean = tf.reduce_mean(cross_entropy + desc_cross_entropy)
+            cross_entropy_mean = tf.reduce_mean(cross_entropy)
         tf.scalar_summary('cross entropy', cross_entropy_mean)
 
     with tf.name_scope('train'):
         train_step = tf.train.GradientDescentOptimizer(FLAGS.learning_rate).minimize(
             cross_entropy_mean)
 
-    return (train_step, cross_entropy_mean, bottleneck_input, descriptions_input, ground_truth_input,
+    return (train_step, cross_entropy_mean, bottleneck_input, ground_truth_input,
             final_tensor)
 
 
@@ -923,7 +852,7 @@ def main(_):
 
     # Set up the pre-trained graph.
     maybe_download_and_extract()
-    graph, bottleneck_tensor, jpeg_data_tensor, resized_image_tensor = (
+    graph, bottleneck_tensor, jpeg_data_tensor = (
         create_inception_graph())
 
     # download all images and label files
@@ -1003,16 +932,6 @@ def main(_):
     #     # make the vocab processor ready
 
     max_document_length = max([len(open(filename, 'r').read().split(' ')) for filename in glob.iglob(IMAGE_DESC_DIR + '/*.txt')])
-    sequence_length = max_document_length
-    vocab_processor = learn.preprocessing.VocabularyProcessor(max_document_length)
-
-    train_descriptions = np.array(list(vocab_processor
-                                       .fit_transform([open(filename, 'r').read()
-                                                       for filename in glob.iglob(IMAGE_DESC_DIR + '/*.txt')])))
-
-    vocab_size = len(vocab_processor.vocabulary_)
-
-    vocab_processor.save(os.path.join('/goshposh/Multi-label-Inception-net/models/combined/', "vocab.pickle"))
 
     if do_distort_images:
         # We will be applying distortions, so setup the operations we'll need.
@@ -1026,10 +945,10 @@ def main(_):
                           jpeg_data_tensor, bottleneck_tensor)
 
     # Add the new layer that we'll be training.
-    (train_step, cross_entropy, bottleneck_input, descriptions_input, ground_truth_input,
+    (train_step, cross_entropy, bottleneck_input, ground_truth_input,
      final_tensor) = add_final_training_ops(class_count,
                                             FLAGS.final_tensor_name,
-                                            bottleneck_tensor, vocab_size,sequence_length)
+                                            bottleneck_tensor)
 
     # Create the operations we need to evaluate the accuracy of our new layer.
     evaluation_step = add_evaluation_step(final_tensor, ground_truth_input)
@@ -1052,21 +971,16 @@ def main(_):
             train_bottlenecks, train_ground_truth = get_random_distorted_bottlenecks(
                 sess, image_lists, FLAGS.train_batch_size, 'training',
                 images_path, distorted_jpeg_data_tensor,
-                distorted_image_tensor, resized_image_tensor, bottleneck_tensor)
+                distorted_image_tensor, bottleneck_tensor)
         else:
             train_bottlenecks, train_ground_truth, descriptions = get_random_cached_bottlenecks(
                 sess, image_lists, FLAGS.train_batch_size, 'training',
                 FLAGS.bottleneck_dir, images_path, jpeg_data_tensor,
                 bottleneck_tensor, labels)
-
-        #vectorize the descriptions
-        train_descriptions = np.array(list(vocab_processor.fit_transform(descriptions)))
-
         # Feed the bottlenecks and ground truth into the graph, and run a training
         # step. Capture training summaries for TensorBoard with the `merged` op.
         train_summary, _ = sess.run([merged, train_step],
                                     feed_dict={bottleneck_input: train_bottlenecks,
-                                               descriptions_input: train_descriptions,
                                                ground_truth_input: train_ground_truth})
         train_writer.add_summary(train_summary, i)
 
@@ -1076,7 +990,6 @@ def main(_):
             train_accuracy, cross_entropy_value = sess.run(
                 [evaluation_step, cross_entropy],
                 feed_dict={bottleneck_input: train_bottlenecks,
-                           descriptions_input: train_descriptions,
                            ground_truth_input: train_ground_truth})
             print('%s: Step %d: Train accuracy = %.1f%%' % (datetime.now(), i,
                                                             train_accuracy * 100))
@@ -1087,15 +1000,11 @@ def main(_):
                     sess, image_lists, FLAGS.validation_batch_size, 'validation',
                     FLAGS.bottleneck_dir, images_path, jpeg_data_tensor,
                     bottleneck_tensor, labels))
-
-            validation_descriptions = np.array(list(vocab_processor.fit_transform(descriptions)))
-
             # Run a validation step and capture training summaries for TensorBoard
             # with the `merged` op.
             validation_summary, validation_accuracy = sess.run(
                 [merged, evaluation_step],
                 feed_dict={bottleneck_input: validation_bottlenecks,
-                           descriptions_input: validation_descriptions,
                            ground_truth_input: validation_ground_truth})
             validation_writer.add_summary(validation_summary, i)
             print('%s: Step %d: Validation accuracy = %.1f%%' %
@@ -1107,13 +1016,9 @@ def main(_):
         sess, image_lists, FLAGS.test_batch_size, 'testing',
         FLAGS.bottleneck_dir, images_path, jpeg_data_tensor,
         bottleneck_tensor, labels)
-
-    test_descriptions = np.array(list(vocab_processor.fit_transform(descriptions)))
-
     test_accuracy = sess.run(
         evaluation_step,
         feed_dict={bottleneck_input: test_bottlenecks,
-                   descriptions_input: test_descriptions,
                    ground_truth_input: test_ground_truth})
     print('Final test accuracy = %.1f%%' % (test_accuracy * 100))
 
